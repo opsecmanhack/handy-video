@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: handy-video VIDEO [OUTPUT.txt]\n'
+    printf '       handy-video model VIDEO [OUTPUT.txt]\n'
+    printf '       handy-video --list-models\n'
+    printf '\n'
+    printf 'Transcribe VIDEO with Handy, saving plain text beside it by default.\n'
+    printf 'Use "model" to choose from installed Handy models interactively.\n'
+    printf 'Set HANDY_MODEL to override the Handy model id.\n'
+}
+
+if [[ $# -eq 1 && "$1" == "--list-models" ]]; then
+    models=$(handy --list-models 2>/dev/null | sed -n '/✓  /p')
+    if [[ -z "$models" ]]; then
+        printf 'No Handy models are downloaded.\n'
+        exit 0
+    fi
+    printf 'Installed Handy models:\n'
+    printf '%s\n' "$models"
+    exit 0
+fi
+
+choose_model() {
+    local model_lines model_ids model_names choice
+    model_lines=$(handy --list-models 2>/dev/null | sed -n '/✓  /p') || {
+        printf 'Error: could not read installed Handy models.\n' >&2
+        exit 1
+    }
+
+    if [[ -z "$model_lines" ]]; then
+        printf 'Error: Handy has no downloaded models.\n' >&2
+        exit 1
+    fi
+
+    model_ids=$(printf '%s\n' "$model_lines" | sed -E 's/^ *✓  ([^ ]+).*$/\1/')
+    model_names=$(printf '%s\n' "$model_lines" | sed -E 's/^ *✓  [^ ]+[[:space:]]+(.+)$/\1/')
+
+    printf 'Installed Handy models:\n' >&2
+    local i=1
+    while IFS= read -r model_name; do
+        printf '  %d) %s\n' "$i" "$model_name" >&2
+        ((i += 1))
+    done <<< "$model_names"
+
+    while true; do
+        printf 'Choose a model [1-%d]: ' "$((i - 1))" >&2
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -lt "$i" ]]; then
+            model=$(printf '%s\n' "$model_ids" | sed -n "${choice}p")
+            return
+        fi
+        printf 'Please enter a number from 1 to %d.\n' "$((i - 1))" >&2
+    done
+}
+
+choose=false
+if [[ $# -ge 1 && "$1" == "model" ]]; then
+    choose=true
+    shift
+fi
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage >&2
+    exit 2
+fi
+
+video=$1
+if [[ ! -f "$video" ]]; then
+    printf 'Error: video not found: %s\n' "$video" >&2
+    exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    printf 'Error: ffmpeg is not installed or not on PATH.\n' >&2
+    exit 1
+fi
+if ! command -v handy >/dev/null 2>&1; then
+    printf 'Error: handy is not installed or not on PATH.\n' >&2
+    exit 1
+fi
+
+if [[ $# -eq 2 ]]; then
+    output=$2
+else
+    output="${video%.*}.txt"
+fi
+
+if [[ "$choose" == true ]]; then
+    choose_model
+else
+    model=${HANDY_MODEL:-parakeet-tdt-0.6b-v3}
+    if ! handy --list-models 2>/dev/null | grep -Fq "✓  $model"; then
+        printf 'Error: Handy model is not downloaded: %s\n' "$model" >&2
+        printf 'Run "handy-video model %s" to choose an installed model.\n' "$video" >&2
+        exit 1
+    fi
+fi
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/handy-video.XXXXXX")
+tmp_output="$tmpdir/transcript.txt"
+trap 'rm -rf "$tmpdir"' EXIT
+
+printf 'Extracting audio...\n' >&2
+ffmpeg -hide_banner -loglevel error -y \
+    -i "$video" \
+    -vn -ac 1 -ar 16000 -c:a pcm_s16le \
+    "$tmpdir/audio.wav"
+
+printf 'Transcribing with Handy (%s)...\n' "$model" >&2
+device_args=()
+if [[ -n "${HANDY_DEVICE_INDEX:-}" ]]; then
+    device_args=(--device-index "$HANDY_DEVICE_INDEX")
+else
+    cpu_device=$(handy --list-devices 2>/dev/null | awk '/kind=cpu/{sub("index=", "", $1); print $1; exit}')
+    if [[ -n "$cpu_device" ]]; then
+        device_args=(--device-index "$cpu_device")
+        printf 'Using Handy CPU device %s to avoid unstable Vulkan GPU cleanup.\n' "$cpu_device" >&2
+    fi
+fi
+
+if handy --transcribe-file "$tmpdir/audio.wav" --model "$model" "${device_args[@]}" > "$tmp_output"; then
+    status=0
+else
+    status=$?
+fi
+
+if [[ -s "$tmp_output" ]]; then
+    mv -f "$tmp_output" "$output"
+    printf 'Saved transcript: %s\n' "$output" >&2
+else
+    printf 'Error: Handy returned no transcript output.\n' >&2
+    exit "${status:-1}"
+fi
+
+if [[ ${status:-0} -ne 0 ]]; then
+    printf 'Warning: Handy exited with status %s after producing the transcript.\n' "$status" >&2
+    printf 'The transcript was saved, but Handy also crashed. This is likely a Handy/Vulkan issue, not your video file.\n' >&2
+    exit "$status"
+fi
